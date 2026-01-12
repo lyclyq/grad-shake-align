@@ -61,6 +61,8 @@ hpo:
   hierarchical:
     enabled: true
     baseline_lr_neighborhood: 5   # +-5 grid points around baseline best
+    baseline_warmup_neighborhood: 2  # +-2 warmup grid points around baseline best
+    baseline_rank_multipliers: [1, 4, 8]  # baseline LoRA rank r uses r * multiplier; R scales with it
 
 io:
   root: runs
