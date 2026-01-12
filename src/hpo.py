@@ -41,13 +41,6 @@ def narrow_lr_grid_around(best_lr: float, full_lrs: List[float], radius: int) ->
     return full_lrs[lo:hi]
 
 
-def narrow_warmup_grid_around(best_warmup: float, full_warmups: List[float], radius: int) -> List[float]:
-    idx = int(np.argmin(np.abs(np.array(full_warmups) - best_warmup)))
-    lo = max(0, idx - radius)
-    hi = min(len(full_warmups), idx + radius + 1)
-    return full_warmups[lo:hi]
-
-
 def _auto_candidates(default: float, power: int) -> List[float]:
     if power <= 1:
         return [default]
@@ -158,49 +151,26 @@ def run_hpo(cfg: Dict[str, Any], base_config_path: str, schedule_path: Optional[
 
     lr_trials = generate_lr_warmup_trials(cfg)
     trial_specs: List[TrialSpec] = []
-    baseline_r = int(cfg['method']['lora']['r'])
-    baseline_R = int(cfg['method']['lora']['R'])
-    multipliers = cfg['hpo'].get('hierarchical', {}).get('baseline_rank_multipliers', [1])
-    multipliers = [int(m) for m in multipliers]
-    trial_id = 0
-    for m in multipliers:
-        rank_r = baseline_r * m
-        rank_R = baseline_R * m
-        for t in lr_trials:
-            override = {
-                'method': {'name': 'baseline', 'lora': {'r': rank_r, 'R': rank_R}},
-                **t,
-            }
-            tag = f'baseline_rmul{m}_lrwu_{trial_id}'
-            trial_specs.append(TrialSpec(trial_id=trial_id, tag=tag, override=override, stage='baseline'))
-            trial_id += 1
+    for i, t in enumerate(lr_trials):
+        trial_specs.append(TrialSpec(trial_id=i, tag=f'baseline_lrwu_{i}', override={'method': {'name': 'baseline'}, **t}, stage='baseline'))
 
     baseline_trials = len(trial_specs)
     full_lrs = _logspace(int(cfg['hpo']['lr_grid']['min_exp']), int(cfg['hpo']['lr_grid']['max_exp']), int(cfg['hpo']['lr_grid']['points']))
 
     best_baseline_lr = float(cfg['train']['lr'])
     best_baseline_warmup = float(cfg['train']['warmup_ratio'])
-    best_rank_multiplier = max(multipliers) if multipliers else 1
-    best_rank_r = baseline_r * best_rank_multiplier
     rows = _read_trials(trials_csv)
     best_id, _, best_cfg = _select_best(
-        [
-            r for r in rows
-            if r['stage'] == 'baseline'
-            and int(r.get('trial_cfg_json', {}).get('method', {}).get('lora', {}).get('r', -1)) == best_rank_r
-        ],
+        [r for r in rows if r['stage'] == 'baseline'],
         metric_key='val/best',
     )
     if best_id >= 0:
         best_baseline_lr = float(best_cfg.get('train', {}).get('lr', best_baseline_lr))
         best_baseline_warmup = float(best_cfg.get('train', {}).get('warmup_ratio', best_baseline_warmup))
 
-    hierarchical = cfg['hpo'].get('hierarchical', {})
-    lr_radius = int(hierarchical.get('baseline_lr_neighborhood', 5))
-    warmup_radius = int(hierarchical.get('baseline_warmup_neighborhood', 2))
-    lrs2 = narrow_lr_grid_around(best_baseline_lr, full_lrs, radius=lr_radius)
-    full_warmups = list(cfg['hpo'].get('warmup_grid', [best_baseline_warmup]))
-    warmups2 = narrow_warmup_grid_around(best_baseline_warmup, full_warmups, radius=warmup_radius)
+    radius = int(cfg['hpo'].get('hierarchical', {}).get('baseline_lr_neighborhood', 5))
+    lrs2 = narrow_lr_grid_around(best_baseline_lr, full_lrs, radius=radius)
+    warmups2 = list(cfg['hpo'].get('warmup_grid', [best_baseline_warmup]))
     custom_trials = generate_custom_grid(cfg)
 
     j = 0
