@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -72,6 +71,7 @@ def resolve_config(base_path: str | Path, schedule_path: Optional[str | Path] = 
         sch = load_yaml(schedule_path)
         cfg = deep_merge(cfg, sch)
     cfg = apply_set_overrides(cfg, set_args)
+    _derive_defaults(cfg)
     validate_config(cfg)
     return cfg
 
@@ -90,6 +90,22 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     compute = cfg.get('compute', {})
     if int(compute.get('gpus_per_trial', 1)) <= 0:
         raise ValueError("compute.gpus_per_trial must be >= 1")
+
+
+def _derive_defaults(cfg: Dict[str, Any]) -> None:
+    cfg.setdefault('log', {})
+    cfg['log'].setdefault('swanlab', {})
+    cfg.setdefault('io', {})
+    cfg.setdefault('train', {})
+    cfg['train'].setdefault('seed', 42)
+
+    stage = cfg.get('stage', '')
+    seeds_cfg = cfg.get('seeds', {})
+    if isinstance(seeds_cfg, dict) and stage in seeds_cfg:
+        cfg['seed_list'] = list(seeds_cfg[stage])
+    elif 'seed_list' not in cfg:
+        seed = cfg['train'].get('seed', 42)
+        cfg['seed_list'] = list(seed) if isinstance(seed, list) else [int(seed)]
 
 
 def dump_json(obj: Any, path: str | Path) -> None:
