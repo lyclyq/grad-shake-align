@@ -1,0 +1,19 @@
+stage: preeval
+
+train:
+  epochs: 2
+  eval:
+    strategy: dense_early
+
+hpo:
+  mode: hierarchical
+  grid_power: 2
+  lr_grid:
+    min_exp: -6
+    max_exp: -3
+    points: 10
+  warmup_grid: [0.0, 0.03, 0.06, 0.1]
+
+seeds:
+  preeval: [12, 24]
+  final: [2, 3, 5, 7, 11]

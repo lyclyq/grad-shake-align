@@ -1,0 +1,75 @@
+stage: debug
+
+task:
+  name: glue/rte           # glue/<task>
+  max_len: 128
+
+model:
+  name: roberta-base       # roberta-base | bert-base-uncased | distilbert-base-uncased | microsoft/deberta-v3-base
+  type: sequence_classification
+
+method:
+  name: baseline           # baseline | ours
+  lora:
+    r: 8
+    R: 32
+    alpha: 16
+    dropout: 0.1
+  ours:
+    votes: 8
+    ema_H: 4
+    percentile_p: 90
+    k: 8.0
+    gamma_r: 0.3
+    gamma_hi: 0.3
+    eta: 0.2
+    beta_max: 0.5
+    rho_max: 0.5
+    alpha_min: 0.1
+    lambda_n: 0.4
+    lambda_o: 0.4
+
+train:
+  epochs: 3
+  batch_size: 32
+  lr: 2e-5
+  warmup_ratio: 0.06
+  weight_decay: 0.01
+  grad_accum: 1
+  max_grad_norm: 1.0
+  seed: 42
+  eval:
+    strategy: dense_early   # dense_early | per_epoch
+    dense_early_epochs: 2
+    dense_early_per_epoch: 8
+
+compute:
+  accelerator: cuda
+  num_gpus: 1
+  gpus_per_trial: 1
+  mixed_precision: bf16     # no | fp16 | bf16
+  compile: false
+
+hpo:
+  mode: grid                # grid | hierarchical
+  lr_grid:
+    min_exp: -6             # 1e-6
+    max_exp: -3             # 1e-3
+    points: 10
+  warmup_grid: [0.0, 0.02, 0.06, 0.1]
+  custom_grid_power: 2      # 2 => each custom hp has 2 candidates
+  hierarchical:
+    enabled: true
+    baseline_lr_neighborhood: 5   # +-5 grid points around baseline best
+
+io:
+  root: runs
+  overwrite: ask            # ask | force | resume
+  save_best_hparams_json: true
+
+log:
+  csv: true
+  swanlab:
+    enabled: false
+    project: "ShakeAlign_LoRA"
+    run_group: null
