@@ -1,54 +1,43 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
 from .loggingx import ExperimentLogger
-from .metrics import glue_metric
 from .shake_align import ShakeAlignController
+from .utils import set_seed
 
 
 def _named_lora_modules(model) -> Dict[str, torch.nn.Module]:
     out = {}
     for name, m in model.named_modules():
-        if hasattr(m, 'lora_A_r') or hasattr(m, 'lora_A'):
+        if getattr(m, 'is_lora_module', False):
             out[name] = m
     return out
 
 
-def evaluate(model, loader: DataLoader, device: torch.device, task_name: str) -> Dict[str, float]:
+def evaluate(model, loader: DataLoader, device: torch.device) -> float:
     model.eval()
-    preds = []
-    labels = []
+    correct = 0
+    total = 0
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             out = model(**batch)
-            preds.append(out.logits.argmax(dim=-1).cpu().numpy())
-            labels.append(batch['labels'].cpu().numpy())
+            preds = out.logits.argmax(dim=-1)
+            labels = batch['labels']
+            correct += (preds == labels).sum().item()
+            total += labels.numel()
     model.train()
-    if not preds:
-        return {'accuracy': 0.0}
-    preds_np = np.concatenate(preds, axis=0)
-    labels_np = np.concatenate(labels, axis=0)
-    task = task_name.split('/', 1)[1] if '/' in task_name else task_name
-    return glue_metric(task, preds_np, labels_np)
+    return correct / max(total, 1)
 
 
-def train_one(
-    cfg: dict,
-    model,
-    train_loader,
-    val_loader,
-    test_loader,
-    logger: ExperimentLogger,
-    task_name: str,
-) -> Dict[str, float]:
+def train_one(cfg: dict, model, train_loader, val_loader, run_dir: str, logger: ExperimentLogger) -> Dict[str, float]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
@@ -66,11 +55,10 @@ def train_one(
     lora_modules = _named_lora_modules(model)
     controller = None
     if cfg['method']['name'] == 'ours':
-        controller = ShakeAlignController(cfg, lora_modules=lora_modules)
+        controller = ShakeAlignController(cfg, lora_modules=list(lora_modules.keys()), device=device)
 
     best_val = -1.0
     best_epoch = -1
-    best_step = -1
 
     global_step = 0
     eval_strategy = cfg['train']['eval']['strategy']
@@ -89,9 +77,11 @@ def train_one(
                 loss.backward()
             else:
                 V = int(cfg['method']['ours']['votes'])
+                # Split into V microbatches (fallback when no vmap).
                 bs = batch['input_ids'].shape[0]
                 micro = max(1, bs // V)
 
+                # We must get per-vote grads AND the final accumulated grad.
                 total_grads: Dict[torch.nn.Parameter, torch.Tensor] = {}
                 controller.reset_step_buffers()
 
@@ -107,7 +97,8 @@ def train_one(
                     loss = out.loss
                     loss.backward()
 
-                    controller.capture_vote_grads(v_idx)
+                    # Snapshot LoRA grads for vote v_idx and also accumulate into total_grads.
+                    controller.capture_vote_grads(model, v_idx)
                     with torch.no_grad():
                         for p in model.parameters():
                             if p.grad is None:
@@ -117,55 +108,41 @@ def train_one(
                             else:
                                 total_grads[p].add_(p.grad.detach())
 
+                # Restore accumulated grad into .grad (single tensor per param), then diagnose + correct in-place.
                 opt.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     for p, g in total_grads.items():
                         p.grad = g
 
-                stats, vote_sums = controller.compute_stats()
-                ctrl_log = controller.apply_in_place_corrections(stats, vote_sums)
-                logger.log_metrics(
-                    'train',
-                    {
-                        'loss': float(loss.item()),
-                        'triggered_blocks': ctrl_log['triggered_blocks'],
-                        'alignment_threshold': ctrl_log['alignment_threshold'],
-                    },
-                    step=global_step,
-                    epoch=ep,
-                )
+                stats = controller.compute_stats()
+                gates = controller.compute_gates(stats)
+                triggered = controller.apply_inplace_correction(model, stats, gates)
 
-            if controller is None:
-                logger.log_metric('train', 'loss', float(loss.item()), step=global_step, epoch=ep)
+                logger.log_step({'train/loss': float(loss.item()), 'train/triggered_blocks': triggered}, step=global_step)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg['train'].get('max_grad_norm', 1.0)))
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg['train'].get('grad_clip', 1.0)))
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
 
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
+            # Dense early eval
             if eval_strategy == 'dense_early' and ep <= int(cfg['train']['eval'].get('dense_early_epochs', 2)):
+                # evaluate dense_eval_per_epoch times per epoch
                 if (global_step % max(1, len(train_loader) // dense_eval_per_epoch)) == 0:
-                    val_metrics = evaluate(model, val_loader, device, task_name)
-                    logger.log_metrics('val', val_metrics, step=global_step, epoch=ep)
-                    val_acc = val_metrics.get('accuracy', 0.0)
+                    val_acc = evaluate(model, val_loader, device)
+                    logger.log_step({'val/acc': val_acc}, step=global_step)
                     if val_acc > best_val:
                         best_val = val_acc
                         best_epoch = ep
-                        best_step = global_step
 
+        # Per-epoch eval
         if eval_strategy == 'per_epoch':
-            val_metrics = evaluate(model, val_loader, device, task_name)
-            logger.log_metrics('val', val_metrics, step=global_step, epoch=ep)
-            val_acc = val_metrics.get('accuracy', 0.0)
+            val_acc = evaluate(model, val_loader, device)
+            logger.log_step({'val/acc': val_acc, 'epoch': ep}, step=global_step)
             if val_acc > best_val:
                 best_val = val_acc
                 best_epoch = ep
-                best_step = global_step
 
-        if test_loader is not None and eval_strategy == 'per_epoch':
-            test_metrics = evaluate(model, test_loader, device, task_name)
-            logger.log_metrics('test', test_metrics, step=global_step, epoch=ep)
-
-    return {'best_val_acc': best_val, 'best_epoch': best_epoch, 'best_step': best_step}
+    return {'best_val_acc': best_val, 'best_epoch': best_epoch}

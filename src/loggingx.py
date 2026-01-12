@@ -1,26 +1,41 @@
 from __future__ import annotations
 
 import csv
+import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 
 class CSVLogger:
-    def __init__(self, path: str | Path, fieldnames: list[str]):
+    def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open('w', newline='', encoding='utf-8')
-        self._writer = csv.DictWriter(self._file, fieldnames=fieldnames)
-        self._writer.writeheader()
+        self._writer: Optional[csv.DictWriter] = None
 
-    def log(self, row: Dict[str, Any]) -> None:
+    def log(self, step: int, data: Dict[str, Any]):
+        row = {'step': step}
+        row.update(data)
+        if self._writer is None:
+            self._writer = csv.DictWriter(self._file, fieldnames=list(row.keys()))
+            self._writer.writeheader()
+        else:
+            # if new keys appear, rewrite header is messy; so we fill missing keys.
+            for k in row.keys():
+                if k not in self._writer.fieldnames:
+                    # extend fieldnames
+                    self._writer.fieldnames = list(self._writer.fieldnames) + [k]
+        # ensure all keys exist
+        for k in self._writer.fieldnames:
+            row.setdefault(k, '')
         self._writer.writerow(row)
         self._file.flush()
 
-    def close(self) -> None:
+    def close(self):
         try:
             self._file.close()
         except Exception:
@@ -28,34 +43,33 @@ class CSVLogger:
 
 
 class SwanLabLogger:
-    """Fail-open SwanLab logger with async queue and error fuse."""
+    """Fail-open SwanLab logger.
 
-    def __init__(self, cfg: Dict[str, Any], run_name: str, config: Dict[str, Any]):
-        sl_cfg = cfg.get('swanlab', {})
-        self.enabled = bool(sl_cfg.get('enabled', False))
+    SwanLab sometimes blocks / hangs depending on environment.
+    We push logs through a background thread; on any exception, we disable.
+    """
+
+    def __init__(self, enabled: bool, project: str, run_name: str, config: Dict[str, Any]):
+        self.enabled = enabled
         self.failed = False
-        self.max_queue = int(sl_cfg.get('max_queue', 2000))
-        self.fail_after = int(sl_cfg.get('fail_after_errors', 3))
-        self._errors = 0
-        self._q: 'queue.Queue[Dict[str, Any]]' = queue.Queue(maxsize=self.max_queue)
+        self._q: 'queue.Queue[Dict[str, Any]]' = queue.Queue(maxsize=1024)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._sl = None
 
-        if not self.enabled:
+        if not enabled:
             return
         try:
             import swanlab  # type: ignore
             self._sl = swanlab
-            self._sl.init(project=sl_cfg.get('project', 'ShakeAlign'), experiment_name=run_name, config=config)
-            if bool(sl_cfg.get('async', True)):
-                self._thread = threading.Thread(target=self._worker, daemon=True)
-                self._thread.start()
+            self._sl.init(project=project, experiment_name=run_name, config=config)
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
         except Exception:
             self.enabled = False
             self.failed = True
 
-    def _worker(self) -> None:
+    def _worker(self):
         while not self._stop.is_set():
             try:
                 item = self._q.get(timeout=0.2)
@@ -67,86 +81,36 @@ class SwanLabLogger:
                 if self._sl is not None:
                     self._sl.log(item)
             except Exception:
-                self._errors += 1
-                if self._errors >= self.fail_after:
-                    self.failed = True
-                    self.enabled = False
-                    return
+                self.failed = True
+                self.enabled = False
+                return
 
-    def log(self, data: Dict[str, Any]) -> None:
+    def log(self, data: Dict[str, Any]):
         if not self.enabled or self.failed:
-            return
-        if self._thread is None and self._sl is not None:
-            try:
-                self._sl.log(data)
-            except Exception:
-                self._errors += 1
-                if self._errors >= self.fail_after:
-                    self.failed = True
-                    self.enabled = False
             return
         try:
             self._q.put_nowait(dict(data))
         except Exception:
+            # drop if queue is full
             pass
 
-    def close(self) -> None:
+    def close(self):
         self._stop.set()
         try:
-            self._q.put_nowait(None)  # type: ignore[arg-type]
+            self._q.put_nowait(None)  # type: ignore
         except Exception:
             pass
 
 
 @dataclass
-class ExperimentLogger:
-    run_dir: Path
-    run_name: str
-    cfg: Dict[str, Any]
-    seed: int
-    trial_id: Optional[int]
+class RunLogger:
     csv: CSVLogger
     swan: SwanLabLogger
-    events_path: Path
 
-    @classmethod
-    def create(
-        cls,
-        run_dir: str | Path,
-        run_name: str,
-        cfg: Dict[str, Any],
-        seed: int,
-        trial_id: Optional[int] = None,
-    ) -> 'ExperimentLogger':
-        run_dir = Path(run_dir)
-        fields = ['step', 'epoch', 'split', 'metric', 'value', 'seed', 'trial_id']
-        csv_logger = CSVLogger(run_dir / 'metrics.csv', fieldnames=fields)
-        swan_logger = SwanLabLogger(cfg.get('log', {}), run_name, config=cfg)
-        events_path = run_dir / 'events.log'
-        events_path.parent.mkdir(parents=True, exist_ok=True)
-        return cls(run_dir, run_name, cfg, seed, trial_id, csv_logger, swan_logger, events_path)
+    def log(self, step: int, data: Dict[str, Any]):
+        self.csv.log(step, data)
+        self.swan.log({'step': step, **data})
 
-    def log_metric(self, split: str, metric: str, value: float, step: int, epoch: int | None = None) -> None:
-        row = {
-            'step': step,
-            'epoch': epoch if epoch is not None else '',
-            'split': split,
-            'metric': metric,
-            'value': float(value),
-            'seed': self.seed,
-            'trial_id': '' if self.trial_id is None else self.trial_id,
-        }
-        self.csv.log(row)
-        self.swan.log({'step': step, f'{split}/{metric}': float(value)})
-
-    def log_metrics(self, split: str, metrics: Dict[str, float], step: int, epoch: int | None = None) -> None:
-        for k, v in metrics.items():
-            self.log_metric(split, k, v, step=step, epoch=epoch)
-
-    def log_event(self, message: str, level: str = 'INFO') -> None:
-        with self.events_path.open('a', encoding='utf-8') as f:
-            f.write(f'[{level}] {message}\n')
-
-    def close(self) -> None:
+    def close(self):
         self.csv.close()
         self.swan.close()

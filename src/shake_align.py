@@ -27,15 +27,12 @@ class ShakeAlignController:
     V is small (8), so we keep per-vote buffers but NEVER store the full per-example gradients.
     """
 
-    def __init__(self, cfg: Dict, lora_modules: Dict[str, torch.nn.Module]):
+    def __init__(self, cfg: Dict):
         self.cfg = cfg
         self.V = int(cfg['method']['ours']['votes'])
         self.H = int(cfg['method']['ours']['ema_H'])
         self.eps = 1e-8
         self.history: Dict[str, BlockStats] = {}
-        self.lora_modules = lora_modules
-        self.votes_r: Dict[str, List[torch.Tensor]] = {}
-        self.votes_hi: Dict[str, List[torch.Tensor]] = {}
 
     def compute_stats_from_votes(
         self,
@@ -44,6 +41,7 @@ class ShakeAlignController:
     ) -> BlockStats:
         """Compute C_r, C_R, A_b from vote matrices."""
         V = votes_r.shape[0]
+        assert V == self.V
 
         # Pairwise dot matrices
         D_r = votes_r @ votes_r.t()                       # [V,V]
@@ -101,42 +99,10 @@ class ShakeAlignController:
         names = [n for n, s in stats.items() if (1.0 - s.A_b) >= thr]
         return thr, names
 
-    def reset_step_buffers(self) -> None:
-        self.votes_r = {k: [] for k in self.lora_modules.keys()}
-        self.votes_hi = {k: [] for k in self.lora_modules.keys()}
-
-    @torch.no_grad()
-    def capture_vote_grads(self, vote_idx: int) -> None:
-        del vote_idx
-        for name, mod in self.lora_modules.items():
-            if getattr(mod, 'lora_A_r', None) is None:
-                continue
-            g_ar = mod.lora_A_r.grad if mod.lora_A_r.grad is not None else torch.zeros_like(mod.lora_A_r)
-            g_br = mod.lora_B_r.grad if mod.lora_B_r.grad is not None else torch.zeros_like(mod.lora_B_r)
-            g_ahi = mod.lora_A_hi.grad if mod.lora_A_hi.grad is not None else torch.zeros_like(mod.lora_A_hi)
-            g_bhi = mod.lora_B_hi.grad if mod.lora_B_hi.grad is not None else torch.zeros_like(mod.lora_B_hi)
-            self.votes_r[name].append(torch.cat([g_ar.flatten(), g_br.flatten()]).detach().clone())
-            self.votes_hi[name].append(torch.cat([g_ahi.flatten(), g_bhi.flatten()]).detach().clone())
-
-    def compute_stats(self) -> Tuple[Dict[str, BlockStats], Dict[str, Dict[str, torch.Tensor]]]:
-        stats: Dict[str, BlockStats] = {}
-        vote_sums: Dict[str, Dict[str, torch.Tensor]] = {}
-        for name in self.votes_r.keys():
-            if len(self.votes_r[name]) == 0:
-                continue
-            votes_r = torch.stack(self.votes_r[name], dim=0)
-            votes_hi = torch.stack(self.votes_hi[name], dim=0)
-            fresh = self.compute_stats_from_votes(votes_r, votes_hi)
-            stats[name] = self.ema_update(name, fresh)
-            vote_sums[name] = {
-                'sum_r': votes_r.sum(dim=0),
-                'sum_hi': votes_hi.sum(dim=0),
-            }
-        return stats, vote_sums
-
     @torch.no_grad()
     def apply_in_place_corrections(
         self,
+        lora_modules: Dict[str, torch.nn.Module],
         stats: Dict[str, BlockStats],
         vote_sums: Dict[str, Dict[str, torch.Tensor]],
     ) -> Dict[str, float]:
@@ -160,7 +126,7 @@ class ShakeAlignController:
 
         triggered = 0
         for name in trig:
-            mod = self.lora_modules[name]
+            mod = lora_modules[name]
             # Expect attributes from DualRankLoRALinear
             if getattr(mod, 'lora_A_r', None) is None or mod.lora_A_r.grad is None:
                 continue

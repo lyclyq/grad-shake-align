@@ -11,14 +11,10 @@ def parse_args():
     common.add_argument('--set', action='append', default=None, help='Override keys: --set train.lr=3e-5')
 
     # Runtime IO controls
-    common.add_argument('--run-id', type=str, default=None, help='Reuse a specific run id (advanced)')
-    common.add_argument('--trial-id', type=int, default=None)
-    common.add_argument('--trial-tag', type=str, default=None)
-    common.add_argument('--runs-dir', type=str, default=None, help='For plot/resume: path to runs dir')
+    common.add_argument('--run_id', type=str, default=None, help='Reuse a specific run id (advanced)')
 
     sub.add_parser('train', parents=[common], help='Single run (one config, one seed)')
     sub.add_parser('hpo', parents=[common], help='Run hyperparameter search')
-    sub.add_parser('resume', parents=[common], help='Resume a run using run-id')
-    sub.add_parser('plot', parents=[common], help='Aggregate runs and generate plots')
+    sub.add_parser('final', parents=[common], help='Run final evaluation suite using best hpo params')
 
     return p.parse_args()
