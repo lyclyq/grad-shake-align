@@ -1,3 +1,4 @@
+# src/loggingx.py
 from __future__ import annotations
 
 import csv
@@ -10,31 +11,34 @@ from typing import Any, Dict, Optional
 
 class CSVLogger:
     """
-    Simple CSV logger:
-      - Always writes to disk (flush per row)
-      - Allows new keys to appear over time (extends header dynamically)
+    Writes a flat dict row to CSV every step (fail-open, flush each write).
     """
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("w", newline="", encoding="utf-8")
         self._writer: Optional[csv.DictWriter] = None
+        self._fieldnames: Optional[list[str]] = None
 
     def log(self, step: int, data: Dict[str, Any]) -> None:
-        row = {"step": step}
-        row.update(data)
+        row = {"step": int(step), **data}
 
         if self._writer is None:
-            self._writer = csv.DictWriter(self._file, fieldnames=list(row.keys()))
+            self._fieldnames = list(row.keys())
+            self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
             self._writer.writeheader()
         else:
-            # If new keys appear, extend header (cheap + practical).
-            for k in row.keys():
-                if k not in self._writer.fieldnames:
-                    self._writer.fieldnames = list(self._writer.fieldnames) + [k]
+            # extend header if new keys appear
+            assert self._fieldnames is not None
+            new_keys = [k for k in row.keys() if k not in self._fieldnames]
+            if new_keys:
+                self._fieldnames += new_keys
+                self._writer.fieldnames = self._fieldnames
 
-        # Fill missing keys so DictWriter won't complain
-        for k in self._writer.fieldnames:
+        # fill missing keys
+        assert self._writer is not None
+        assert self._fieldnames is not None
+        for k in self._fieldnames:
             row.setdefault(k, "")
 
         self._writer.writerow(row)
@@ -49,16 +53,14 @@ class CSVLogger:
 
 class SwanLabLogger:
     """
-    Fail-open SwanLab logger:
-      - logs through a background thread
-      - if swanlab import/logging fails, training continues
-      - drops logs if queue is full
+    Fail-open SwanLab logger (async background thread).
+    If swanlab import/log fails, it disables itself and training continues.
     """
     def __init__(self, enabled: bool, project: str, run_name: str, config: Dict[str, Any]):
         self.enabled = bool(enabled)
         self.failed = False
 
-        self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
+        self._q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=2048)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._sl = None
@@ -70,11 +72,9 @@ class SwanLabLogger:
             import swanlab  # type: ignore
             self._sl = swanlab
             self._sl.init(project=project, experiment_name=run_name, config=config)
-
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
         except Exception:
-            # fail-open
             self.enabled = False
             self.failed = True
 
@@ -84,26 +84,24 @@ class SwanLabLogger:
                 item = self._q.get(timeout=0.2)
             except queue.Empty:
                 continue
-
             if item is None:
                 return
-
             try:
                 if self._sl is not None:
                     self._sl.log(item)
             except Exception:
-                # fail-open permanently
-                self.failed = True
+                # permanently fail-open
                 self.enabled = False
+                self.failed = True
                 return
 
     def log(self, data: Dict[str, Any]) -> None:
-        if not self.enabled or self.failed:
+        if (not self.enabled) or self.failed:
             return
         try:
             self._q.put_nowait(dict(data))
         except Exception:
-            # drop if full / any error
+            # drop on overflow / error
             pass
 
     def close(self) -> None:
@@ -117,18 +115,31 @@ class SwanLabLogger:
 @dataclass
 class RunLogger:
     """
-    Unified logger used by trainer:
+    Runner-side unified logger:
       logger.log(step, {"train/loss":..., "val/acc":...})
     """
     csv: CSVLogger
     swan: SwanLabLogger
 
     def log(self, step: int, data: Dict[str, Any]) -> None:
-        # CSV expects flat columns
         self.csv.log(step, data)
-        # SwanLab: add step field
-        self.swan.log({"step": step, **data})
+        self.swan.log({"step": int(step), **data})
 
     def close(self) -> None:
         self.csv.close()
         self.swan.close()
+
+
+class ExperimentLogger:
+    """
+    Trainer-side compatibility wrapper:
+      logger.log_step({"train/loss": ...}, step=xxx)
+    """
+    def __init__(self, csv_logger: CSVLogger, swan_logger: SwanLabLogger):
+        self._r = RunLogger(csv=csv_logger, swan=swan_logger)
+
+    def log_step(self, data: Dict[str, Any], step: int) -> None:
+        self._r.log(step, data)
+
+    def close(self) -> None:
+        self._r.close()

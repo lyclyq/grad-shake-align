@@ -1,8 +1,8 @@
+# src/lora_layers.py
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,8 +10,7 @@ import torch.nn as nn
 
 class LoRALinear(nn.Module):
     """Drop-in replacement for nn.Linear with LoRA (A @ B) adaptation.
-
-    We follow the common 'A random, B zero' init so the adaptation is 0 at step 0.
+    Common init: A random, B zero => adaptation = 0 at step 0.
     """
 
     def __init__(self, base: nn.Linear, r: int, alpha: float, dropout: float = 0.0):
@@ -44,9 +43,14 @@ class LoRALinear(nn.Module):
 class DualRankLoRALinear(nn.Module):
     """Dual-rank LoRA: rank-r core + rank-(R-r) extension.
 
-    Naming convention matches your LaTeX:
-      - r branch: (U_r, V_r) ~ (A_r, B_r)
-      - hi branch: (U_hi, V_hi) ~ (A_hi, B_hi)
+    Naming (matches your LaTeX):
+      - r branch : (U_r, V_r) ~ (A_r, B_r)
+      - hi branch: (U_hi,V_hi)~ (A_hi,B_hi)
+
+    Init:
+      - A_r: Kaiming, B_r: 0
+      - A_hi: Normal,  B_hi: 0
+    => both branches contribute 0 at step 0, but have gradients.
     """
 
     def __init__(self, base: nn.Linear, r: int, R: int, alpha: float, dropout: float = 0.0):
@@ -56,7 +60,8 @@ class DualRankLoRALinear(nn.Module):
         self.r = r
         self.R = R
         self.hi = R - r
-        # scaling: keep same convention as LoRA core (alpha / r). You can also choose alpha / R.
+
+        # scaling uses core convention alpha/r (consistent with your current code)
         self.scaling = alpha / r
         self.dropout = nn.Dropout(dropout)
 
@@ -72,17 +77,16 @@ class DualRankLoRALinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # r branch: A random, B zero => update starts at zero but has a well-defined grad direction
         nn.init.kaiming_uniform_(self.lora_A_r, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B_r)
 
-        # hi branch: U_hi ~ N(0, sigma), V_hi = 0
         nn.init.normal_(self.lora_A_hi, std=0.02)
         nn.init.zeros_(self.lora_B_hi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.base(x)
         dx = self.dropout(x)
+
         path_r = (dx @ self.lora_A_r.T) @ self.lora_B_r.T
         path_hi = (dx @ self.lora_A_hi.T) @ self.lora_B_hi.T
         return res + (path_r + path_hi) * self.scaling
@@ -103,11 +107,7 @@ def inject_lora(
     dropout: float,
     target_substrings: Optional[List[str]] = None,
 ) -> List[str]:
-    """Replace selected nn.Linear modules with LoRA-wrapped modules.
-
-    `target_substrings`: if provided, only modules whose names contain any substring are replaced.
-    Returns the list of replaced module names.
-    """
+    """Replace selected nn.Linear modules with LoRA-wrapped modules."""
     assert mode in {"baseline", "ours"}
 
     replaced: List[str] = []
@@ -117,11 +117,11 @@ def inject_lora(
             return True
         return any(s in name for s in target_substrings)
 
-    # We need parent modules to replace children
+    # Need parent modules to replace children
     name_to_parent = {}
     for full_name, module in model.named_modules():
-        for child_name, child in module.named_children():
-            name_to_parent[f"{full_name}.{child_name}".strip('.')] = (module, child_name)
+        for child_name, _child in module.named_children():
+            name_to_parent[f"{full_name}.{child_name}".strip(".")] = (module, child_name)
 
     for name, lin in list(_iter_named_linears(model)):
         if not should_replace(name):
@@ -148,3 +148,65 @@ def lora_block_names(model: nn.Module) -> List[str]:
         if hasattr(m, "lora_A_r") or hasattr(m, "lora_A"):
             names.append(name)
     return names
+
+
+# -------------------------
+# Debug helpers (NEW)
+# -------------------------
+def iter_dualrank_modules(model: nn.Module) -> Iterator[Tuple[str, DualRankLoRALinear]]:
+    for name, m in model.named_modules():
+        if hasattr(m, "lora_A_r") and hasattr(m, "lora_A_hi"):
+            yield name, m  # type: ignore
+
+
+@torch.no_grad()
+def debug_check_dualrank_init(
+    model: nn.Module,
+    assert_hi_zero: bool = True,
+    max_blocks_to_print: int = 3,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Prints/returns initialization checks for DualRankLoRALinear:
+      - nested existence
+      - ||B_hi|| == 0 (zero contribution)
+    Returns: per_block norms dict for optional logging.
+    """
+    blocks = list(iter_dualrank_modules(model))
+    print(f"[DBG][Init] dualrank_blocks={len(blocks)} assert_hi_zero={assert_hi_zero}")
+
+    out: Dict[str, Dict[str, float]] = {}
+    for i, (name, m) in enumerate(blocks):
+        Ar = m.lora_A_r
+        Br = m.lora_B_r
+        Ahi = m.lora_A_hi
+        Bhi = m.lora_B_hi
+
+        n_Ar = float(Ar.norm().item())
+        n_Br = float(Br.norm().item())
+        n_Ahi = float(Ahi.norm().item())
+        n_Bhi = float(Bhi.norm().item())
+
+        out[name] = {
+            "Ar_norm": n_Ar,
+            "Br_norm": n_Br,
+            "Ahi_norm": n_Ahi,
+            "Bhi_norm": n_Bhi,
+        }
+
+        ok = (n_Bhi == 0.0)
+        if assert_hi_zero and not ok:
+            raise AssertionError(f"[DBG][Init] {name}: expected ||Bhi||=0 but got {n_Bhi}")
+
+        if i < max_blocks_to_print:
+            print(
+                f"[DBG][Init][{name}] "
+                f"Ar={tuple(Ar.shape)} Br={tuple(Br.shape)} "
+                f"Ahi={tuple(Ahi.shape)} Bhi={tuple(Bhi.shape)} "
+                f"||Ar||={n_Ar:.4f} ||Br||={n_Br:.4f} ||Ahi||={n_Ahi:.4f} ||Bhi||={n_Bhi:.4f} "
+                f"{'OK' if ok else 'NOT_ZERO'}"
+            )
+
+    if len(blocks) > max_blocks_to_print:
+        print(f"[DBG][Init] ... ({len(blocks) - max_blocks_to_print} more blocks omitted)")
+
+    return out

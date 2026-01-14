@@ -16,9 +16,13 @@ method:
     R: 32
     alpha: 16
     dropout: 0.1
+
   ours:
-    votes: 8
+    # legacy field (kept for backward compat; only used when history.enabled=false)
     ema_H: 4
+
+    votes: 8  # kept but now voting is controlled by voting.samples_per_vote (votes here is no longer used as "micro-splits")
+
     percentile_p: 90
     k: 8.0
     gamma_r: 0.3
@@ -30,11 +34,29 @@ method:
     lambda_n: 0.4
     lambda_o: 0.4
 
+    # ---- NEW: voting control ----
+    voting:
+      samples_per_vote: 8        # {16, 8, 4}  -> default 8 samples per vote window (batch=32 => 4 windows)
+      allow_tail: true
+
+      # combination votes (排列组合票): uses window vote vectors to build extra votes (no extra backward)
+      combine_votes: false       # set true to enable combination votes
+      combine_size: 2            # combine 2 windows at a time
+      combine_max: 0             # 0 = no cap; or set like 16 to limit
+      keep_single_votes: true    # keep original single-window votes alongside combined votes
+
+    # ---- NEW: history / truncated EMA over steps ----
+    history:
+      enabled: true
+      window_steps: 4            # {8,4,2} you wanted; default 4 steps history
+      weighting: exp             # exp | uniform | linear
+      exp_beta: 0.7              # decay factor for exp weighting (newest weight=1)
+
 train:
   epochs: 3
   batch_size: 32
   lr: 2e-5
-  warmup_ratio: 0.06         # 固定，不参与搜索
+  warmup_ratio: 0.06
   weight_decay: 0.01
   grad_accum: 1
   max_grad_norm: 1.0
@@ -59,12 +81,9 @@ hpo:
     max_exp: -3
     points: 15
 
-  # warmup fixed (single value) — keep for backward compat, but do NOT expand trials
   warmup_grid: [0.06]
-
   baseline_lr_points: 5
 
-  # staged ours search defaults
   ours:
     lr_neighbor_points_small: 7
     lr_neighbor_points_large: 5
@@ -103,3 +122,14 @@ log:
     enabled: false
     project: "ShakeAlign_LoRA"
     run_group: null
+
+debug:
+  enabled: true
+  print_every_steps: 20
+  max_blocks_to_print: 3
+  dump_init: true
+  dump_votes: true
+  dump_gates: true
+  dump_grad_norms: true
+  dump_history: false         # set true if you want to print history window weights
+  assert_hi_zero_init: true
