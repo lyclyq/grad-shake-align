@@ -1,4 +1,3 @@
-# src/trainer.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
@@ -70,15 +69,11 @@ def _vote_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ours = cfg.get("method", {}).get("ours", {}) or {}
     voting = ours.get("voting", {}) or {}
     return {
-        # how many samples per vote window
-        "samples_per_vote": int(voting.get("samples_per_vote", 8)),  # 16/8/4
-        # combine votes (using existing windows, no extra backward)
+        "samples_per_vote": int(voting.get("samples_per_vote", 8)),
         "combine_enabled": bool(voting.get("combine_votes", False)),
-        "combine_size": int(voting.get("combine_size", 2)),  # combine 2 windows -> 1 combined vote
-        "combine_max": int(voting.get("combine_max", 0)),  # 0 means no cap; otherwise cap #combined votes
-        # if true, also include the original single-window votes (recommended)
+        "combine_size": int(voting.get("combine_size", 2)),
+        "combine_max": int(voting.get("combine_max", 0)),
         "keep_single_votes": bool(voting.get("keep_single_votes", True)),
-        # If batch not divisible, allow last smaller vote
         "allow_tail": bool(voting.get("allow_tail", True)),
     }
 
@@ -228,7 +223,6 @@ def train_one(
                     if max_comb > 0:
                         combs = combs[:max_comb]
 
-                    # combined vote = sum of selected window votes (per block)
                     for name in lora_modules.keys():
                         for c in combs:
                             vr = torch.stack([win_votes_r[name][i] for i in c], dim=0).sum(dim=0)
@@ -245,12 +239,12 @@ def train_one(
                 for name in lora_modules.keys():
                     if len(votes_r[name]) == 0:
                         continue
-                    vr = torch.stack(votes_r[name], dim=0)     # [V_eff, d_r]
-                    vhi = torch.stack(votes_hi[name], dim=0)   # [V_eff, d_hi]
+                    vr = torch.stack(votes_r[name], dim=0)
+                    vhi = torch.stack(votes_hi[name], dim=0)
                     fresh = controller.compute_stats_from_votes(vr, vhi)
                     smooth = controller.ema_update(name, fresh)
                     stats[name] = smooth
-                    vote_sums[name] = {"sum_r": vr.sum(dim=0)}  # Σ_r in r-space
+                    vote_sums[name] = {"sum_r": vr.sum(dim=0)}
 
                 # ---- periodic vote/stat debug ----
                 if dbg["enabled"] and dbg["dump_votes"] and (global_step % dbg["print_every_steps"] == 0):
@@ -261,14 +255,14 @@ def train_one(
                         items.append((mis, n, s, srn))
                     items.sort(reverse=True, key=lambda x: x[0])
 
-                    print(f"[DBG][Step={global_step}][VoteCfg] bs={bs} spv={spv} windows={len(windows)} "
-                          f"single_votes={len(win_votes_r[next(iter(lora_modules.keys()))]) if lora_modules else 0} "
-                          f"combine={vote_cfg['combine_enabled']} size={vote_cfg['combine_size']}")
+                    print(
+                        f"[DBG][Step={global_step}][VoteCfg] bs={bs} spv={spv} windows={len(windows)} "
+                        f"single_votes={len(win_votes_r[next(iter(lora_modules.keys()))]) if lora_modules else 0} "
+                        f"combine={vote_cfg['combine_enabled']} size={vote_cfg['combine_size']}"
+                    )
                     print(f"[DBG][Step={global_step}][Vote] top{dbg['max_blocks_to_print']} by misalign")
                     for mis, n, s, srn in items[: dbg["max_blocks_to_print"]]:
-                        print(
-                            f"  [{n}] A={s.A_b:.4f} mis={mis:.4f} Cr={s.C_r:.4f} CR={s.C_R:.4f} ||sum_r||={srn:.4f}"
-                        )
+                        print(f"  [{n}] A={s.A_b:.4f} mis={mis:.4f} Cr={s.C_r:.4f} CR={s.C_R:.4f} ||sum_r||={srn:.4f}")
 
                 # apply correction (+ gate trace + optional history trace)
                 info = controller.apply_in_place_corrections(
@@ -310,14 +304,13 @@ def train_one(
                             gn = (info.get("per_block_grad_norm", {}) or {}).get(n, None)
                             if gn is not None:
                                 print(
-                                    f"    ||g_r|| {gn['g_r_before']:.4f}->{gn['g_r_after']:.4f}  "
-                                    f"||g_hi|| {gn['g_hi_before']:.4f}->{gn['g_hi_after']:.4f}"
+                                    f"    ||g_r|| {gn.get('g_r_before', 0.0):.4f}->{gn.get('g_r_after', 0.0):.4f}  "
+                                    f"||g_hi|| {gn.get('g_hi_before', 0.0):.4f}->{gn.get('g_hi_after', 0.0):.4f}"
                                 )
                         if dbg["dump_history"]:
                             hd = (info.get("per_block_history", {}) or {}).get(n, None)
                             if hd is not None and hd.get("enabled", False):
                                 print(f"    [HIST] mode={hd.get('mode')} n={hd.get('n')} window={hd.get('window_steps')}")
-                                # 只打权重，窗口内容太长的话你自己看 info dict 更稳
                                 print(f"    [HIST] weights={hd.get('weights')}")
 
                 loss_val = float(loss.item()) if loss is not None else 0.0

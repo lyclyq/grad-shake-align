@@ -11,40 +11,78 @@ from typing import Any, Dict, Optional
 
 class CSVLogger:
     """
-    Writes a flat dict row to CSV every step (fail-open, flush each write).
+    Writes a flat dict row to CSV (fail-open, flush each write),
+    but merges multiple log() calls with the same step into ONE row.
     """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("w", newline="", encoding="utf-8")
         self._writer: Optional[csv.DictWriter] = None
-        self._fieldnames: Optional[list[str]] = None
+        self._fieldnames: list[str] = []
 
-    def log(self, step: int, data: Dict[str, Any]) -> None:
-        row = {"step": int(step), **data}
+        # --- NEW: step aggregation ---
+        self._pending_step: Optional[int] = None
+        self._pending_row: Dict[str, Any] = {}
 
+    def _ensure_writer(self, row: Dict[str, Any]) -> None:
         if self._writer is None:
             self._fieldnames = list(row.keys())
             self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
             self._writer.writeheader()
         else:
             # extend header if new keys appear
-            assert self._fieldnames is not None
             new_keys = [k for k in row.keys() if k not in self._fieldnames]
             if new_keys:
                 self._fieldnames += new_keys
+                assert self._writer is not None
                 self._writer.fieldnames = self._fieldnames
 
+    def _flush_pending(self) -> None:
+        if self._pending_step is None:
+            return
+        row = {"step": int(self._pending_step), **self._pending_row}
+
+        # ensure writer + header covers all keys
+        self._ensure_writer(row)
+
         # fill missing keys
-        assert self._writer is not None
-        assert self._fieldnames is not None
         for k in self._fieldnames:
             row.setdefault(k, "")
 
+        assert self._writer is not None
         self._writer.writerow(row)
         self._file.flush()
 
+        # clear
+        self._pending_step = None
+        self._pending_row = {}
+
+    def log(self, step: int, data: Dict[str, Any]) -> None:
+        step = int(step)
+
+        # first log
+        if self._pending_step is None:
+            self._pending_step = step
+            self._pending_row = dict(data)
+            return
+
+        # same step -> merge
+        if step == self._pending_step:
+            self._pending_row.update(data)
+            return
+
+        # step advanced (or went backwards): flush old then start new
+        self._flush_pending()
+        self._pending_step = step
+        self._pending_row = dict(data)
+
     def close(self) -> None:
+        try:
+            self._flush_pending()
+        except Exception:
+            pass
         try:
             self._file.close()
         except Exception:
@@ -90,7 +128,6 @@ class SwanLabLogger:
                 if self._sl is not None:
                     self._sl.log(item)
             except Exception:
-                # permanently fail-open
                 self.enabled = False
                 self.failed = True
                 return
@@ -101,7 +138,6 @@ class SwanLabLogger:
         try:
             self._q.put_nowait(dict(data))
         except Exception:
-            # drop on overflow / error
             pass
 
     def close(self) -> None:

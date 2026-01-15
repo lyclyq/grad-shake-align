@@ -1,4 +1,3 @@
-# configs/base.yaml
 stage: debug
 
 task:
@@ -21,9 +20,28 @@ method:
     # legacy field (kept for backward compat; only used when history.enabled=false)
     ema_H: 4
 
-    votes: 8  # kept but now voting is controlled by voting.samples_per_vote (votes here is no longer used as "micro-splits")
+    votes: 8  # legacy; actual voting controlled by voting.samples_per_vote
 
+    # -------------------------
+    # FIRST LAYER TRIGGER (主方向门槛)
+    # mode:
+    #   - percentile: 触发 top% 的 “worst blocks” (by metric badness)
+    #   - cos_threshold: 硬阈值触发
+    # metric:
+    #   - C_r | C_R | A_b | misalign
+    #   * C_r/C_R/A_b: 越小越糟（<= tau 触发）
+    #   * misalign=1-A_b: 越大越糟（>= tau 触发）
+    # -------------------------
+    trigger:
+      mode: percentile            # percentile | cos_threshold
+      metric: C_R                 # C_r | C_R | A_b | misalign
+      percentile_p: 90            # only when mode=percentile
+      cos_threshold: 0.30         # only when mode=cos_threshold
+
+    # backward compat
     percentile_p: 90
+
+    # gates / correction hypers
     k: 8.0
     gamma_r: 0.3
     gamma_hi: 0.3
@@ -34,29 +52,36 @@ method:
     lambda_n: 0.4
     lambda_o: 0.4
 
-    # ---- NEW: voting control ----
+    # -------------------------
+    # CORRECTION MODE（只保留两种）
+    # direction_only: 只做 beta_r/beta_hi + joint CAGrad（不做 alpha；不 rescale）
+    # both: alpha + (beta + CAGrad)（不 rescale）
+    # -------------------------
+    correction:
+      mode: both                  # both | direction_only
+      direction_rescale: false    # kept for compat; ignored by controller
+
+    # ---- voting control ----
     voting:
-      samples_per_vote: 8        # {16, 8, 4}  -> default 8 samples per vote window (batch=32 => 4 windows)
+      samples_per_vote: 8        # {16, 8, 4} -> default 8 samples per vote window (batch=32 => 4 windows)
       allow_tail: true
+      combine_votes: false
+      combine_size: 2
+      combine_max: 0
+      keep_single_votes: true
 
-      # combination votes (排列组合票): uses window vote vectors to build extra votes (no extra backward)
-      combine_votes: false       # set true to enable combination votes
-      combine_size: 2            # combine 2 windows at a time
-      combine_max: 0             # 0 = no cap; or set like 16 to limit
-      keep_single_votes: true    # keep original single-window votes alongside combined votes
-
-    # ---- NEW: history / truncated EMA over steps ----
+    # ---- history / truncated EMA over steps ----
     history:
       enabled: true
-      window_steps: 4            # {8,4,2} you wanted; default 4 steps history
+      window_steps: 4            # {8,4,2}
       weighting: exp             # exp | uniform | linear
-      exp_beta: 0.7              # decay factor for exp weighting (newest weight=1)
+      exp_beta: 0.7
 
 train:
   epochs: 3
   batch_size: 32
   lr: 2e-5
-  warmup_ratio: 0.06
+  warmup_ratio: 0.1
   weight_decay: 0.01
   grad_accum: 1
   max_grad_norm: 1.0
@@ -70,7 +95,7 @@ compute:
   accelerator: cuda
   num_gpus: 1
   gpus_per_trial: 1
-  mixed_precision: bf16
+  mixed_precision: "fp32"
   compile: false
 
 hpo:
@@ -131,5 +156,5 @@ debug:
   dump_votes: true
   dump_gates: true
   dump_grad_norms: true
-  dump_history: false         # set true if you want to print history window weights
+  dump_history: false
   assert_hi_zero_init: true

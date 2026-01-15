@@ -1,137 +1,103 @@
-# src/config.py
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
 
+def _deep_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in u.items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            _deep_update(d[k], v)
+        else:
+            d[k] = v
+    return d
+
+
+def _set_by_dotted_key(cfg: Dict[str, Any], dotted: str, value: Any) -> None:
+    parts = dotted.split(".")
+    cur = cfg
+    for p in parts[:-1]:
+        if p not in cur or not isinstance(cur[p], dict):
+            cur[p] = {}
+        cur = cur[p]
+    cur[parts[-1]] = value
+
+
+def _parse_value(s: str) -> Any:
+    ss = s.strip()
+    # bool
+    if ss.lower() in {"true", "false"}:
+        return ss.lower() == "true"
+    # int
+    try:
+        if ss.startswith("0") and ss != "0" and not ss.startswith("0."):
+            # keep as string for things like 02? (rare)
+            pass
+        else:
+            i = int(ss)
+            return i
+    except Exception:
+        pass
+    # float
+    try:
+        f = float(ss)
+        return f
+    except Exception:
+        pass
+    # fallback string
+    return ss
+
+
 def load_yaml(path: str | Path) -> Dict[str, Any]:
-    p = Path(path)
-    with p.open("r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
-def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            deep_merge(base[k], v)
-        else:
-            base[k] = v
-    return base
-
-
-def _parse_scalar(val: str) -> Any:
-    s = val.strip()
-    lo = s.lower()
-    if lo in {"true", "false"}:
-        return lo == "true"
-    if lo in {"none", "null"}:
-        return None
-    try:
-        if s.startswith("0") and len(s) > 1 and s[1].isdigit():
-            raise ValueError
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        return s
-
-
-def apply_set_overrides(cfg: Dict[str, Any], set_args: Optional[List[str]]) -> Dict[str, Any]:
-    if not set_args:
-        return cfg
-    for kv in set_args:
-        if "=" not in kv:
-            continue
-        key_path, raw_val = kv.split("=", 1)
-        val = _parse_scalar(raw_val)
-        keys = key_path.split(".")
-        cur = cfg
-        for k in keys[:-1]:
-            if k not in cur or not isinstance(cur[k], dict):
-                cur[k] = {}
-            cur = cur[k]
-        cur[keys[-1]] = val
-    return cfg
-
-
 def resolve_config(
-    base_path: str | Path,
-    schedule_path: Optional[str | Path] = None,
+    base_path: str,
+    schedule_path: Optional[str] = None,
     set_args: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     cfg = load_yaml(base_path)
+
+    # schedule overlay
     if schedule_path:
-        sch = load_yaml(schedule_path)
-        cfg = deep_merge(cfg, sch)
-    cfg = apply_set_overrides(cfg, set_args)
+        sched = load_yaml(schedule_path)
+        _deep_update(cfg, sched)
+
+    # CLI overrides: --set a.b.c=value
+    if set_args:
+        for item in set_args:
+            if "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            _set_by_dotted_key(cfg, k.strip(), _parse_value(v))
+
     validate_config(cfg)
     return cfg
 
 
-def _validate_staged_hpo(cfg: Dict[str, Any]) -> None:
-    hpo = cfg.get("hpo", {})
-    if not isinstance(hpo, dict):
-        return
-    ours = hpo.get("ours", {})
-    if not isinstance(ours, dict):
-        return
-    stages = ours.get("stages", {})
-    if not stages:
-        return
-    if not isinstance(stages, dict):
-        raise ValueError("hpo.ours.stages must be a dict")
-
-    for key in ["s1", "s2", "s3"]:
-        if key not in stages:
-            continue
-        s = stages[key]
-        if not isinstance(s, dict):
-            raise ValueError(f"hpo.ours.stages.{key} must be a dict")
-        if "epochs" in s and int(s["epochs"]) <= 0:
-            raise ValueError(f"hpo.ours.stages.{key}.epochs must be > 0")
-        if "trials" in s and int(s["trials"]) <= 0:
-            raise ValueError(f"hpo.ours.stages.{key}.trials must be > 0")
-
-    # score weights sanity
-    score = stages.get("s3", {}).get("score", {})
-    if isinstance(score, dict):
-        w = float(score.get("w_max", 0.5)) + float(score.get("w_final", 0.4)) + float(score.get("w_avg", 0.1))
-        if abs(w - 1.0) > 1e-6:
-            raise ValueError("hpo.ours.stages.s3.score weights must sum to 1.0")
-
-
 def validate_config(cfg: Dict[str, Any]) -> None:
+    # minimal validations (keep research code not brittle)
     method = cfg.get("method", {}).get("name")
     if method not in {"baseline", "ours"}:
         raise ValueError(f"method.name must be 'baseline' or 'ours', got: {method}")
 
-    lora = cfg.get("method", {}).get("lora", {})
-    r, R = int(lora.get("r", 0)), int(lora.get("R", 0))
-    if r <= 0 or R <= 0 or R <= r:
-        raise ValueError(f"LoRA ranks must satisfy 0 < r < R. Got r={r}, R={R}")
+    lora = cfg.get("method", {}).get("lora", {}) or {}
+    r = int(lora.get("r", 0))
+    R = int(lora.get("R", 0))
 
-    compute = cfg.get("compute", {})
+    # ✅ Baseline uses single-rank LoRA: allow R==r (or even missing R)
+    if method == "baseline":
+        if r <= 0:
+            raise ValueError(f"Baseline LoRA rank must satisfy r>0. Got r={r}")
+    else:
+        # ✅ Ours is dual-rank LoRA
+        if r <= 0 or R <= 0 or R <= r:
+            raise ValueError(f"LoRA ranks must satisfy 0 < r < R. Got r={r}, R={R}")
+
+    compute = cfg.get("compute", {}) or {}
     if int(compute.get("gpus_per_trial", 1)) <= 0:
         raise ValueError("compute.gpus_per_trial must be >= 1")
-
-    # warmup search is forbidden (must be fixed single value)
-    hpo = cfg.get("hpo", {})
-    if isinstance(hpo, dict) and "warmup_grid" in hpo:
-        wg = hpo.get("warmup_grid")
-        if isinstance(wg, list) and len(wg) > 1:
-            raise ValueError("warmup_grid length > 1 is disabled (warmup fixed). Set hpo.warmup_grid=[0.06] only.")
-
-    _validate_staged_hpo(cfg)
-
-
-def dump_json(obj: Any, path: str | Path) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
